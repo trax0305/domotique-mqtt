@@ -1,4 +1,5 @@
-// Étape 2 — 2 LED RGB pilotées par MQTT (CONTRAT_MQTT v1.0, §4.1 et §4.2)
+// Étape 3 — LED RGB + capteur de luminosité + alerte au seuil + configuration
+// CONTRAT_MQTT v1.0 : §4.1/4.2 (LED), §4.3 (mesure), §4.4 (alerte), §4.5/4.6 (config)
 // ESP32 Wokwi -> AWS IoT Core (MQTT/TLS mutuel, port 8883)
 // Bibliothèques (libraries.txt) : MQTT (Joel Gaehwiler), ArduinoJson
 
@@ -16,6 +17,9 @@ const char* CLIENT_ID = "esp32-01";           // = nom du Thing AWS
 
 const char* T_STATUS = PREFIX "status";
 const char* T_LUX    = PREFIX "capteur/luminosite";
+const char* T_ALERT  = PREFIX "alertes";
+const char* T_CFG_SET   = PREFIX "config/set";
+const char* T_CFG_STATE = PREFIX "config/state";
 const char* T_LED_SET[2]   = { PREFIX "led/1/set",   PREFIX "led/2/set" };
 const char* T_LED_STATE[2] = { PREFIX "led/1/state", PREFIX "led/2/state" };
 
@@ -28,7 +32,7 @@ const uint8_t LED_PINS[2][3] = {
   { 25, 26, 27 },   // LED 1
   { 18, 19, 21 }    // LED 2
 };
-const uint32_t PWM_FREQ = 5000;
+const uint32_t PWM_FREQ = 1000;
 const uint8_t  PWM_BITS = 8;                  // 0..255
 
 struct LedState {
@@ -43,6 +47,22 @@ bool   pendingState[2] = { false, false };
 String pendingReqId[2];
 
 unsigned long lastPub = 0;
+
+// ---------- Capteur de luminosité (photorésistance Wokwi) ----------
+const uint8_t LDR_PIN = 34;                    // AO du module -> GPIO 34 (ADC1)
+const float   LDR_VCC = 3.3;                   // module alimenté en 3V3
+const float   GAMMA = 0.7, RL10 = 50;          // constantes de la doc Wokwi
+const unsigned long SAMPLE_MS  = 1000;         // lecture + contrôle du seuil
+const unsigned long PUBLISH_MS = 1000;         // publication de la mesure (§4.3)
+const float   HYSTERESIS_LUX = 10;             // sortie d'alerte à seuil + 10 (§4.4)
+
+float alertThresholdLux = 100;                 // valeur initiale (§4.5)
+bool  alertActive = false;
+float lastLux = 0;
+unsigned long lastSample = 0;
+
+bool pendingCfgState = false;
+bool pendingAlert = false;
 
 // ---------- PWM (compatible cœur ESP32 Arduino 2.x et 3.x) ----------
 void pwmInit() {
@@ -86,6 +106,68 @@ String toHexColor(const LedState& s) {
   char buf[8];
   snprintf(buf, sizeof(buf), "#%02X%02X%02X", s.r, s.g, s.b);
   return String(buf);
+}
+
+// ---------- Lecture du capteur ----------
+float readLux() {
+  int raw = analogRead(LDR_PIN);               // 0..4095
+  float v = raw / 4095.0 * LDR_VCC;
+  if (v >= LDR_VCC - 0.001) return 0;          // obscurité totale
+  if (v <= 0.001) v = 0.001;                   // évite une division par zéro
+  float resistance = 10000 * v / (LDR_VCC - v);
+  float lux = pow(RL10 * 1e3 * pow(10, GAMMA) / resistance, 1 / GAMMA);
+  return round(lux * 10) / 10.0;               // 1 décimale
+}
+
+// Alerte avec hystérésis : entrée sous le seuil, sortie à seuil + 10 lux (§4.4)
+void checkThreshold(float lux) {
+  if (!alertActive && lux < alertThresholdLux) {
+    alertActive = true;  pendingAlert = true;
+  } else if (alertActive && lux >= alertThresholdLux + HYSTERESIS_LUX) {
+    alertActive = false; pendingAlert = true;
+  }
+}
+
+void publishAlert() {
+  JsonDocument doc;
+  doc["type"] = "LOW_LUMINOSITY";
+  doc["lux"] = lastLux;
+  doc["thresholdLux"] = alertThresholdLux;
+  doc["active"] = alertActive;
+  String out; serializeJson(doc, out);
+  bool ok = mqtt.publish(T_ALERT, out, false, 0);          // pas de RETAIN (§4.4)
+  Serial.println("[TX] " + String(T_ALERT) + " -> " + out + (ok ? "" : "  (ÉCHEC)"));
+}
+
+void publishMeasure() {
+  JsonDocument doc;
+  doc["lux"] = lastLux;
+  doc["alertActive"] = alertActive;
+  String out; serializeJson(doc, out);
+  bool ok = mqtt.publish(T_LUX, out, false, 0);            // QoS 0, pas de RETAIN (§3)
+  Serial.println("[TX] " + String(T_LUX) + " -> " + out + (ok ? "" : "  (ÉCHEC)"));
+}
+
+void publishConfigState() {
+  JsonDocument doc;
+  doc["alertThresholdLux"] = alertThresholdLux;
+  String out; serializeJson(doc, out);
+  bool ok = mqtt.publish(T_CFG_STATE, out, true, 0);       // RETAIN (§4.6)
+  Serial.println("[TX] " + String(T_CFG_STATE) + " -> " + out + (ok ? "" : "  (ÉCHEC)"));
+}
+
+// ---------- Réception d'une configuration (§4.5) ----------
+void handleConfigSet(const String& payload) {
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) { Serial.printf("[ERR] config : JSON invalide (%s)\n", err.c_str()); return; }
+  if (!doc["alertThresholdLux"].is<float>() || doc["alertThresholdLux"].as<float>() < 0) {
+    Serial.println("[ERR] config : 'alertThresholdLux' doit être un nombre >= 0"); return;
+  }
+  alertThresholdLux = doc["alertThresholdLux"].as<float>();
+  Serial.printf("[CFG] nouveau seuil : %.1f lux\n", alertThresholdLux);
+  checkThreshold(lastLux);                     // réévalue l'alerte avec le nouveau seuil
+  pendingCfgState = true;                      // confirmation publiée dans loop()
 }
 
 // ---------- Publication de l'état réellement appliqué (§4.2) ----------
@@ -137,6 +219,7 @@ void onMessage(String &topic, String &payload) {
   Serial.println("[RX] " + topic + " -> " + payload);
   for (int i = 0; i < 2; i++)
     if (topic == T_LED_SET[i]) { handleLedSet(i, payload); return; }
+  if (topic == T_CFG_SET) { handleConfigSet(payload); return; }
 }
 
 // ---------- Connexions ----------
@@ -161,9 +244,11 @@ void connectMqtt() {
     if (mqtt.connect(CLIENT_ID)) {
       Serial.println(" connecté");
       for (int i = 0; i < 2; i++) mqtt.subscribe(T_LED_SET[i], 1);
+      mqtt.subscribe(T_CFG_SET, 1);
       mqtt.publish(T_STATUS, "{\"online\":true}", true, 0);
       // À chaque (re)connexion : état réel des 2 LED, sans requestId (§4.2)
       for (int i = 0; i < 2; i++) publishState(i, "");
+      publishConfigState();                    // seuil courant, retenu (§4.6)
     } else {
       char err[128];
       net.lastError(err, sizeof(err));
@@ -191,6 +276,8 @@ void setup() {
   mqtt.onMessage(onMessage);
   mqtt.setOptions(60, true, 10000);   // keepalive 60 s, session propre, timeout 10 s (TLS Wokwi lent)
   connectMqtt();
+  lastLux = readLux();
+  checkThreshold(lastLux);
 }
 
 void loop() {
@@ -207,11 +294,19 @@ void loop() {
   for (int i = 0; i < 2; i++)
     if (pendingState[i]) { pendingState[i] = false; publishState(i, pendingReqId[i]); }
 
-  // Mesure factice (le vrai capteur arrive à l'étape 3)
-  if (millis() - lastPub > 5000) {
+  if (pendingCfgState) { pendingCfgState = false; publishConfigState(); }
+
+  // Lecture du capteur et contrôle du seuil chaque seconde
+  if (millis() - lastSample >= SAMPLE_MS) {
+    lastSample = millis();
+    lastLux = readLux();
+    checkThreshold(lastLux);
+  }
+  if (pendingAlert) { pendingAlert = false; publishAlert(); }
+
+  // Publication de la mesure toutes les 5 s (§4.3)
+  if (millis() - lastPub >= PUBLISH_MS) {
     lastPub = millis();
-    String msg = "{\"lux\":" + String(100 + (millis() / 1000) % 50) + ",\"alertActive\":false}";
-    bool ok = mqtt.publish(T_LUX, msg, false, 0);
-    Serial.println("[TX] " + String(T_LUX) + " -> " + msg + (ok ? "" : "  (ÉCHEC)"));
+    publishMeasure();
   }
 }
