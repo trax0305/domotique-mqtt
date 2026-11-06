@@ -1,0 +1,37 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "iot:Connect",
+      "Resource": "arn:aws:iot:eu-west-1:712666834276:client/esp32-01"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["iot:Publish", "iot:RetainPublish"],
+      "Resource": [
+        "arn:aws:iot:eu-west-1:712666834276:topic/domotique/v1/esp32-01/led/*/state",
+        "arn:aws:iot:eu-west-1:712666834276:topic/domotique/v1/esp32-01/capteur/luminosite",
+        "arn:aws:iot:eu-west-1:712666834276:topic/domotique/v1/esp32-01/alertes",
+        "arn:aws:iot:eu-west-1:712666834276:topic/domotique/v1/esp32-01/config/state",
+        "arn:aws:iot:eu-west-1:712666834276:topic/domotique/v1/esp32-01/status"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "iot:Subscribe",
+      "Resource": [
+        "arn:aws:iot:eu-west-1:712666834276:topicfilter/domotique/v1/esp32-01/led/*/set",
+        "arn:aws:iot:eu-west-1:712666834276:topicfilter/domotique/v1/esp32-01/config/set"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "iot:Receive",
+      "Resource": [
+        "arn:aws:iot:eu-west-1:712666834276:topic/domotique/v1/esp32-01/led/*/set",
+        "arn:aws:iot:eu-west-1:712666834276:topic/domotique/v1/esp32-01/config/set"
+      ]
+    }
+  ]
+}
