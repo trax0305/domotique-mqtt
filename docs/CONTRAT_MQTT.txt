@@ -1,0 +1,141 @@
+CONTRAT MQTT — VERSION 1.0 (proposition commune à valider)
+Projet : Domotique LED RGB + luminosité + scénarios
+Date : 2026-11-06
+
+1. PÉRIMÈTRE
+- 1 ESP32 simulé dans Wokwi, identifié « esp32-01 ».
+- 2 LED RGB indépendantes, numérotées 1 et 2.
+- 1 capteur de luminosité simulé (valeurs en lux estimés).
+- App React Native avec Expo Go, broker AWS IoT Core, stockage historique InfluxDB.
+- Les scénarios sont pilotés par l'app et utilisent les commandes LED existantes.
+
+2. PRÉFIXE DES TOPICS
+  domotique/v1/esp32-01/
+
+3. TABLE DES TOPICS
+Topic complet                                         | Source  | Destination          | QoS | RETAIN
+-----------------------------------------------------|---------|----------------------|-----|-------
+domotique/v1/esp32-01/led/1/set                      | Mobile  | ESP32                | 1   | NON
+domotique/v1/esp32-01/led/1/state                    | ESP32   | Mobile               | 1   | OUI
+domotique/v1/esp32-01/led/2/set                      | Mobile  | ESP32                | 1   | NON
+domotique/v1/esp32-01/led/2/state                    | ESP32   | Mobile               | 1   | OUI
+domotique/v1/esp32-01/capteur/luminosite             | ESP32   | Mobile + InfluxDB    | 0   | NON
+domotique/v1/esp32-01/alertes                       | ESP32   | Mobile               | 1   | NON
+domotique/v1/esp32-01/config/set                    | Mobile  | ESP32                | 1   | NON
+domotique/v1/esp32-01/config/state                  | ESP32   | Mobile               | 1   | OUI
+domotique/v1/esp32-01/status                        | ESP32   | Mobile               | 1   | OUI
+
+4. FORMATS JSON
+
+4.1 LED /set — Mobile -> ESP32
+{
+  "requestId": "cmd-001",
+  "on": true,
+  "color": "#FF0000",
+  "brightness": 70
+}
+- requestId : chaîne non vide, unique pour chaque commande émise.
+- on : booléen (true/false).
+- color : chaîne hexadécimale #RRGGBB en majuscules ou minuscules.
+- brightness : entier de 0 à 100 inclus (pourcentage).
+- Tous les champs sont requis. Même avec on=false, transmettre la couleur et la luminosité mémorisées.
+- Si la commande est rejouée, elle doit produire le même état (idempotence).
+
+4.2 LED /state — ESP32 -> Mobile
+{
+  "requestId": "cmd-001",
+  "on": true,
+  "color": "#FF0000",
+  "brightness": 70
+}
+- L'ESP32 publie après avoir réellement appliqué la commande.
+- Il renvoie le requestId de la commande s'il s'agit d'une confirmation.
+- Si l'état est publié spontanément au démarrage, requestId est omis.
+- À la reconnexion, l'ESP32 publie l'état réel de chacune des LED avec RETAIN=true.
+- L'app distingue 'commande en cours' et 'état confirmé'.
+
+4.3 Mesure — ESP32 -> Mobile et historique
+{
+  "lux": 125.5,
+  "alertActive": false
+}
+- lux : nombre >= 0, estimation de luminosité ambiante en lux.
+- alertActive : booléen indiquant si le seuil d'alerte est actuellement franchi.
+- Fréquence cible : toutes les 5 secondes, ajustable après les tests.
+- L'horodatage de stockage est ajouté dans la règle AWS avec timestamp() (ms UTC).
+- Un capteur Wokwi simulé ne fournit pas nécessairement une mesure calibrée réelle.
+
+4.4 Alerte — ESP32 -> Mobile
+{
+  "type": "LOW_LUMINOSITY",
+  "lux": 85,
+  "thresholdLux": 100,
+  "active": true
+}
+- Publier active=true seulement lors de l'entrée en alerte (lux < seuil).
+- Publier active=false lors de la sortie d'alerte (proposition : lux >= seuil + 10 lux).
+- Les messages n'ont pas RETAIN ; le dernier état actif reste dans alertActive des mesures.
+- La marge de 10 lux évite un clignotement des alertes autour du seuil.
+
+4.5 Configuration /set — Mobile -> ESP32
+{
+  "alertThresholdLux": 100
+}
+- alertThresholdLux : nombre >= 0 (lux).
+- Valeur initiale : 100 lux.
+- L'ESP32 applique cette valeur et publie un message /config/state avec la même structure.
+- Au redémarrage du simulateur, le seuil revient à 100 sauf si une persistance locale a été implémentée.
+
+4.6 Configuration /state — ESP32 -> Mobile
+{
+  "alertThresholdLux": 100
+}
+- Publier après application de la configuration et au démarrage ; RETAIN=true.
+
+4.7 Disponibilité /status — ESP32 et broker -> Mobile
+{ "online": true }
+{ "online": false }
+- Publier true en ligne avec RETAIN=true.
+- Utiliser un Last Will MQTT (LWT) qui publie false avec RETAIN=true lors d'une coupure inattendue.
+- Sur un arrêt volontaire, publier false avant de se déconnecter.
+- Une valeur retenue indique l'information la plus récente reçue, pas une garantie absolue de présence.
+
+5. RÈGLES GENERALES
+- Transport ESP32 : MQTT sur TLS vers AWS IoT Core (typiquement 8883).
+- Transport Expo Go : MQTT via WSS, avec authentification AWS SigV4 et identifiants temporaires.
+- Client IDs différents pour chaque connexion, notamment chaque téléphone.
+- Ne pas mettre de clé AWS permanente ou de clé privée dans le dépôt.
+- QoS 1 est 'au moins une fois', pas 'exactement une fois' ; gérer les doublons.
+- RETAIN toujours à false sur les commandes /set pour ne pas réactiver une ancienne commande après reconnexion.
+- AWS IoT Core : pour récupérer immédiatement les messages retenus, s'abonner aux noms de topics EXACTS, pas uniquement à des filtres + / #.
+- Les messages de /state représentent l'état réellement appliqué, jamais seulement l'état demandé.
+- Erreur de payload : ESP32 ignore la commande invalide et consigne l'erreur dans le moniteur série ; un canal d'erreur dédié est hors périmètre V1.
+
+6. SCÉNARIOS
+- Les scénarios sont enregistrés dans l'application (stockage local dans la V1).
+- Exemple « Cinéma » : publier /led/1/set avec bleu + 20%, puis /led/2/set avec on=false.
+- Les deux commandes sont indépendantes : le scénario n'est pas atomique.
+- L'interface confirme chaque LED en se basant sur son /state, et non sur la publication /set.
+
+7. INFLUXDB
+- V1 : historiser les mesures de /capteur/luminosite.
+- Horodatage au moment du traitement par AWS IoT Rules : timestamp() (millisecondes UTC).
+- Ne pas supposer que l'action native AWS vers InfluxDB prend en charge toute offre gratuite InfluxDB Cloud : valider la destination avant déploiement.
+- Les scénarios sauvegardés ne sont pas stockés dans InfluxDB.
+
+8. TESTS DE CONFORMITÉ
+T01 : la commande led/1/set modifie LED 1, LED 2 reste inchangée.
+T02 : led/1/state renvoie les valeurs réellement appliquées et le requestId.
+T03 : une nouvelle souscription exacte à led/1/state reçoit le dernier état retenu.
+T04 : aucune commande /set n'est conservée et rejouée automatiquement.
+T05 : le capteur publie lux et alertActive environ toutes les 5 secondes.
+T06 : franchir le seuil génère une alerte active=true une fois ; la sortir émet false.
+T07 : config/set modifie le seuil et config/state confirme.
+T08 : un arrêt inattendu de l'ESP32 entraîne un status offline via LWT si la déconnexion est détectée.
+T09 : AWS peut horodater et router une mesure vers l'historique sélectionné.
+T10 : Expo Go reçoit états / mesures et peut publier les commandes de manière authentifiée.
+
+9. GOUVERNANCE
+- Ce document est la source de vérité.
+- Tout changement de topic ou de propriété JSON nécessite un accord des deux développeurs.
+- Numéro de version à incrémenter si un changement casse la compatibilité.

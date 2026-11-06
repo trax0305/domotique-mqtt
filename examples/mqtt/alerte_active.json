@@ -1,0 +1,6 @@
+{
+  "type": "LOW_LUMINOSITY",
+  "lux": 85,
+  "thresholdLux": 100,
+  "active": true
+}
